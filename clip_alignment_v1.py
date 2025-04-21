@@ -1,53 +1,203 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from transformers import ViTModel, BertModel, BertTokenizer
+from PIL import Image
+import numpy as np
+import os
+import warnings
+warnings.filterwarnings('ignore')
 
+# ------------------ æ ¸å¿ƒæ¨¡å‹æ¶æ„ï¼ˆä¿®å¤è·¯å¾„å¤„ç†ï¼‰------------------
 class ImageEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, freeze_vit_layers=6):
         super().__init__()
-        # ÊÓ¾õÖ÷¸ÉÍøÂç£¨Ê¾ÀıÓÃÏßĞÔ²ã´úÌæ£©
-        self.visual_backbone = nn.Sequential(
-            nn.Linear(3*224*224, 768),  # ¼ÙÉèÊäÈëÎª224x224 RGBÍ¼Ïñ
-            nn.ReLU()
+        self.visual_backbone = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        
+        # åˆ†å±‚å†»ç»“ç­–ç•¥
+        for layer in self.visual_backbone.encoder.layer[:freeze_vit_layers]:
+            for param in layer.parameters():
+                param.requires_grad_(False)
+            
+        self.projection = nn.Sequential(
+            nn.LayerNorm(768),
+            nn.Linear(768, 512),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+
+    def forward(self, image):
+        features = self.visual_backbone(pixel_values=image).last_hidden_state[:, 0, :]
+        return F.normalize(self.projection(features), dim=-1)
+
+class TextEncoder(nn.Module):
+    def __init__(self, freeze_bert_layers=3):
+        super().__init__()
+        self.bert = BertModel.from_pretrained("bert-base-uncased")
+        
+        # å†»ç»“å‰Nå±‚å‚æ•°
+        for layer in self.bert.encoder.layer[:freeze_bert_layers]:
+            for param in layer.parameters():
+                param.requires_grad_(False)
+                
+        self.projection = nn.Sequential(
+            nn.LayerNorm(768),
+            nn.Linear(768, 512),
+            nn.GELU(),
+            nn.Dropout(0.1)
         )
         
-        # ÓïÒå·ÖÖ§£¨´¦ÀíÓïÒåÊäÈë£©
-        self.semantic_proj = nn.Linear(768, 768)  # ±£³ÖÎ¬¶ÈÒ»ÖÂ
-        
-        # ¶àÄ£Ì¬ÈÚºÏ²ã£¨µ÷ÕûÊäÈëÎ¬¶ÈÆ¥Åä£©
-        self.fusion_layer = nn.Linear(768 * 2, 768)  # Æ´½ÓºóÎ¬¶È·­±¶
-        
-        # ×îÖÕÍ¶Ó°²ã£¨µ÷ÕûÊä³öÎ¬¶È£©
-        self.final_proj = nn.Linear(768, 512)  # ÕıÈ·Î¬¶ÈÅäÖÃ
+    def forward(self, input_ids, attention_mask):
+        features = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        ).last_hidden_state[:, 0, :]
+        return F.normalize(self.projection(features), dim=-1)
 
-    def forward(self, image, semantic=None, weights=None):
-        # ÊÓ¾õÌØÕ÷ÌáÈ¡
-        visual_feat = self.visual_backbone(image.flatten(1))  # [B, 768]
+# ------------------ å¯¹é½åº¦è®¡ç®—æ¨¡å—ï¼ˆä¿®å¤è·¯å¾„å¤„ç†ï¼‰------------------
+class CLIPAlignmentAnalyzer:
+    def __init__(self, clip_model, tokenizer, device=None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.clip_model = clip_model.to(self.device)
+        self.tokenizer = tokenizer
+        self.clip_model.eval()
         
-        # ·ÖÖ§´¦Àí
-        if semantic is not None:
-            semantic_feat = self.semantic_proj(semantic)  # [B, 768]
-            # ¶àÄ£Ì¬ÈÚºÏ£¨Æ´½Ó£©
-            fused_feat = torch.cat([visual_feat, semantic_feat], dim=1)  # [B, 1536]
-            visual_feat = self.fusion_layer(fused_feat)  # [B, 768]
+    def _prepare_text(self, texts):
+        return self.tokenizer(
+            texts, 
+            padding=True, 
+            return_tensors="pt",
+            max_length=77,  # CLIPæ ‡å‡†é•¿åº¦
+            truncation=True,
+            return_token_type_ids=False
+        ).to(self.device)
+    
+    def calculate_similarity(self, images, texts):
+        """æ”¯æŒæ‰¹é‡ä¸å•æ ·æœ¬çš„çµæ´»å¤„ç†"""
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            text_inputs = self._prepare_text(texts)
+            image_features = self.clip_model.image_encoder(images.to(self.device))
+            text_features = self.clip_model.text_encoder(**text_inputs)
+            
+            logit_scale = self.clip_model.logit_scale.exp()
+            similarity = logit_scale * image_features @ text_features.t()
+        return similarity.cpu()
+    
+    def visualize_alignment(self, similarity_matrix, texts, figsize=(12, 10)):
+        """ä¼˜åŒ–å¯è§†åŒ–æ˜¾ç¤º"""
+        plt.figure(figsize=figsize, dpi=120)
+        matrix = similarity_matrix.numpy() if torch.is_tensor(similarity_matrix) else similarity_matrix
         
-        # ¼ÓÈ¨ÈÚºÏ£¨Ê¾Àı£©
-        if weights is not None:
-            # ¼ÙÉèÈ¨ÖØÓ¦ÓÃÓÚ¶à³ß¶ÈÌØÕ÷£¨Ğèµ÷ÕûÊµ¼ÊÊµÏÖ£©
-            pass  
+        heatmap = plt.imshow(matrix, cmap='plasma', aspect='auto')
+        plt.colorbar(heatmap, fraction=0.046, pad=0.04)
+        plt.xticks(np.arange(len(texts)), texts, rotation=55, ha='right')
+        plt.yticks(np.arange(len(texts)), [f"Image {i+1}" for i in range(len(texts))])
+        plt.title("Cross-Modal Semantic Alignment", pad=20)
+        plt.xlabel("Text Descriptions", labelpad=15)
+        plt.ylabel("Visual Content", labelpad=15)
+        plt.tight_layout()
+        plt.show()
+    
+    def save_model(self, path):
+        """ä¿®å¤ä¿å­˜é€»è¾‘ï¼šåˆ›å»ºä¸“ç”¨tokenizerå­ç›®å½•"""
+        # ç¡®ä¿çˆ¶ç›®å½•å­˜åœ¨
+        save_dir = os.path.dirname(path) or '.'  # å¤„ç†æ— ç›®å½•çš„æƒ…å†µ
+        os.makedirs(save_dir, exist_ok=True)
         
-        # ×îÖÕÍ¶Ó°
-        output = self.final_proj(visual_feat)  # [B, 512]
-        return output
+        # åˆ›å»ºä¸“ç”¨tokenizerå­ç›®å½•
+        tokenizer_dir = os.path.join(save_dir, "tokenizer")
+        self.tokenizer.save_pretrained(tokenizer_dir)
+        
+        # ä¿å­˜æ¨¡å‹æ—¶è®°å½•tokenizerè·¯å¾„
+        torch.save({
+            'clip_model': self.clip_model.state_dict(),
+            'tokenizer_dir': tokenizer_dir,
+        }, path)
+    
+    @classmethod
+    def load_model(cls, path, device=None):
+        """ä¿®å¤åŠ è½½é€»è¾‘ï¼šä½¿ç”¨å®Œæ•´tokenizerè·¯å¾„"""
+        current_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # æ·»åŠ å®‰å…¨å…¨å±€å£°æ˜ï¼ˆå¿…é¡»åœ¨åŠ è½½å‰æ‰§è¡Œï¼‰
+        torch.serialization.add_safe_globals([BertTokenizer])
+        
+        try:
+            checkpoint = torch.load(path, 
+                                  weights_only=True,
+                                  map_location=current_device)
+        except Exception as e:
+            print(f"å®‰å…¨æ¨¡å¼åŠ è½½å¤±è´¥: {str(e)}")
+            print("å°è¯•éå®‰å…¨æ¨¡å¼åŠ è½½ï¼ˆä»…é™å¯ä¿¡æ¥æºï¼ï¼‰")
+            checkpoint = torch.load(path, 
+                                  weights_only=False,
+                                  map_location=current_device)
+        
+        # ä»ä¸“ç”¨ç›®å½•åŠ è½½tokenizer
+        tokenizer = BertTokenizer.from_pretrained(checkpoint['tokenizer_dir'])
+        
+        # åˆå§‹åŒ–æ¨¡å‹
+        clip_model = CLIPModel()
+        clip_model.load_state_dict(checkpoint['clip_model'])
+        
+        return cls(clip_model, tokenizer, current_device)
 
-# ÑéÖ¤´úÂë
+# ------------------ å®Œæ•´CLIPæ¨¡å‹ï¼ˆä¿æŒåŸæ ·ï¼‰------------------
+class CLIPModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.image_encoder = ImageEncoder()
+        self.text_encoder = TextEncoder()
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
+        
+    def forward(self, image, text):
+        image_features = self.image_encoder(image)
+        text_features = self.text_encoder(**text)
+        return image_features, text_features
+
+# ------------------ ä½¿ç”¨ç¤ºä¾‹ï¼ˆæ·»åŠ è·¯å¾„éªŒè¯ï¼‰------------------
 if __name__ == "__main__":
-    image_encoder = ImageEncoder()
-    dummy_image = torch.randn(2, 3, 224, 224)  # ÊäÈëĞÎ×´ [2, 3, 224, 224]
-    dummy_semantic = torch.randn(2, 768)
-    
-    # ÈıÖÖµ÷ÓÃ·½Ê½ÑéÖ¤
-    output1 = image_encoder(dummy_image)  # ½öÊÓ¾õ
-    output2 = image_encoder(dummy_image, dummy_semantic)  # ÊÓ¾õ+ÓïÒå
-    output3 = image_encoder(dummy_image, dummy_semantic, weights=[0.8, 0.2])  # ¼ÓÈ¨
-    
-    print(f"Output shapes: {output1.shape}, {output2.shape}, {output3.shape}")
+    try:
+        # è®¾å¤‡æ£€æµ‹ä¸å†…å­˜ä¼˜åŒ–
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch.cuda.empty_cache() if device == "cuda" else None
+        
+        # åˆå§‹åŒ–ç»„ä»¶
+        clip_model = CLIPModel().to(device)
+        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        
+        # åˆ›å»ºåˆ†æå™¨
+        analyzer = CLIPAlignmentAnalyzer(clip_model, tokenizer, device)
+        
+        # æµ‹è¯•æ•°æ®
+        test_images = torch.randn(3, 3, 224, 224).to(device) * 0.5 + 0.5
+        test_texts = [
+            "A black cat sitting on wooden floor",
+            "Golden retriever playing in park",
+            "Red sports car on highway"
+        ]
+        
+        # è®¡ç®—å¯¹é½åº¦
+        similarity_matrix = analyzer.calculate_similarity(test_images, test_texts)
+        
+        # ç»“æœå¯è§†åŒ–
+        print("\nè¯­ä¹‰å¯¹é½çŸ©é˜µ:")
+        print(similarity_matrix.numpy().round(2))
+        analyzer.visualize_alignment(similarity_matrix, test_texts)
+        
+        # æ¨¡å‹ä¿å­˜ä¸åŠ è½½æµ‹è¯•ï¼ˆæŒ‡å®šå®Œæ•´è·¯å¾„ï¼‰
+        model_path = "saved_models/clip_align_model.pth"  # æ˜¾å¼æŒ‡å®šç›®å½•ç»“æ„
+        analyzer.save_model(model_path)
+        loaded_analyzer = CLIPAlignmentAnalyzer.load_model(model_path)
+        
+        # å•æ ·æœ¬æµ‹è¯•
+        single_image = torch.randn(1, 3, 224, 224).to(device) * 0.5 + 0.5
+        caption = "Cute puppy looking at camera"
+        similarity = analyzer.calculate_similarity(single_image, [caption])
+        print(f"\nå•æ ·æœ¬å¯¹é½åˆ†æ•°: {similarity.item():.2f}")
+        
+    except Exception as e:
+        print(f"è¿è¡Œæ—¶é”™è¯¯: {str(e)}")
+        if "CUDA" in str(e):
+            print("è¯·æ£€æŸ¥GPUé©±åŠ¨å’ŒCUDAç‰ˆæœ¬å…¼å®¹æ€§")
