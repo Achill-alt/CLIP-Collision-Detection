@@ -1,3 +1,5 @@
+#!pip install numpy pandas torch  # 安装多个库
+#!apt-get install -y libgl1-mesa-glx  # 安装系统依赖
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
