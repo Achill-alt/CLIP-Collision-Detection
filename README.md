@@ -6,3 +6,5 @@ clip_alignment_v1.py是CLIP语义对齐度计算模块基础模块
 clip_alignment_v2.py是优化动态阈值算法（基于混淆矩阵反馈）后的版本
 
 clip_alignment_v3.py是集成冲突权重衰减逻辑（权重0.7→0.3）后的版本
+
+clip_alignment_v3.py是最终版
